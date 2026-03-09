@@ -1,6 +1,5 @@
 reviews:
+  auto_apply_labels: true
   auto_review:
-    enabled: true
-    auto_incremental_review: true
     base_branches:
-      - ".*"
+      - .*
