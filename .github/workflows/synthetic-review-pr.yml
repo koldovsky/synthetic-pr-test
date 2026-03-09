@@ -1,0 +1,145 @@
+name: Synthetic review PR
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: synthetic-review-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  synthesize-review-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Guard unsupported push events
+        id: guard
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          # Skip the initial branch push where GitHub cannot provide a usable diff base.
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Build synthetic branch names
+        if: steps.guard.outputs.skip == 'false'
+        id: names
+        env:
+          ACTOR: ${{ github.actor }}
+          AFTER: ${{ github.event.after }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          short_after="${AFTER:0:12}"
+          safe_actor="$(printf '%s' "$ACTOR" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')"
+
+          echo "base_ref=review-base/${safe_actor}/${short_after}-${RUN_ID}-${RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "head_ref=review-head/${safe_actor}/${short_after}-${RUN_ID}-${RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create synthetic branches
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          BASE_REF: ${{ steps.names.outputs.base_ref }}
+          HEAD_REF: ${{ steps.names.outputs.head_ref }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            async function createRef(refName, sha) {
+              const ref = `refs/heads/${refName}`;
+
+              try {
+                await github.rest.git.createRef({ owner, repo, ref, sha });
+                core.info(`Created ${ref} -> ${sha}`);
+              } catch (error) {
+                if (error.status === 422) {
+                  core.warning(`Ref already exists: ${ref}`);
+                  return;
+                }
+
+                throw error;
+              }
+            }
+
+            await createRef(process.env.BASE_REF, process.env.BEFORE);
+            await createRef(process.env.HEAD_REF, process.env.AFTER);
+
+      - name: Open synthetic PR
+        if: steps.guard.outputs.skip == 'false'
+        id: create_pr
+        uses: actions/github-script@v7
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          BASE_REF: ${{ steps.names.outputs.base_ref }}
+          HEAD_REF: ${{ steps.names.outputs.head_ref }}
+          COMPARE_URL: ${{ github.event.compare }}
+          PUSHER: ${{ github.actor }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const before = process.env.BEFORE;
+            const after = process.env.AFTER;
+            const title = `Synthetic review: ${process.env.PUSHER} pushed ${before.slice(0, 7)}..${after.slice(0, 7)} to ${process.env.TARGET_BRANCH}`;
+
+            const body = [
+              `This PR was generated automatically from a push to \`${process.env.TARGET_BRANCH}\`.`,
+              ``,
+              `Review window: \`${before}\` .. \`${after}\``,
+              `Pusher: @${process.env.PUSHER}`,
+              ``,
+              `Purpose: provide PR review UI for changes that already landed on \`${process.env.TARGET_BRANCH}\`.`,
+              ``,
+              `Compare URL: ${process.env.COMPARE_URL}`
+            ].join('\n');
+
+            const pr = await github.rest.pulls.create({
+              owner,
+              repo,
+              title,
+              head: process.env.HEAD_REF,
+              base: process.env.BASE_REF,
+              body,
+              maintainer_can_modify: false
+            });
+
+            core.setOutput('url', pr.data.html_url);
+            core.setOutput('number', String(pr.data.number));
+
+      - name: Add run summary
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          {
+            echo "## Synthetic review PR created"
+            echo
+            echo "- Base branch: \`${{ steps.names.outputs.base_ref }}\`"
+            echo "- Head branch: \`${{ steps.names.outputs.head_ref }}\`"
+            echo "- Review window: \`${{ github.event.before }}\` .. \`${{ github.event.after }}\`"
+            echo "- PR: ${{ steps.create_pr.outputs.url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
